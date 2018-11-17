@@ -1,9 +1,9 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
-use either::Either;
 use quote::{ToTokens, Tokens};
-use svd::{Cluster, ClusterInfo, Defaults, Peripheral, Register};
+use svd::{Cluster, ClusterInfo, Defaults, Peripheral, Register, RegisterCluster, RegisterInfo};
 use syn::{self, Ident};
 
 use errors::*;
@@ -12,25 +12,36 @@ use util::{self, ToSanitizedSnakeCase, ToSanitizedUpperCase, BITS_PER_BYTE};
 use generate::register;
 
 pub fn render(
-    p: &Peripheral,
+    p_original: &Peripheral,
     all_peripherals: &[Peripheral],
     defaults: &Defaults,
     nightly: bool,
 ) -> Result<Vec<Tokens>> {
     let mut out = vec![];
 
+    let p_derivedfrom = p_original.derived_from.as_ref().and_then(|s| {
+        all_peripherals.iter().find(|x| x.name == *s)
+    });
+
+    let p_merged = p_derivedfrom.map(|ancestor| p_original.derive_from(ancestor));
+    let p = p_merged.as_ref().unwrap_or(p_original);
+
+    if p_original.derived_from.is_some() && p_derivedfrom.is_none() {
+        eprintln!("Couldn't find derivedFrom original: {} for {}, skipping",
+            p_original.derived_from.as_ref().unwrap(), p_original.name);
+        return Ok(out);
+    }
+
     let name_pc = Ident::new(&*p.name.to_sanitized_upper_case());
     let address = util::hex(p.base_address);
     let description = util::escape_brackets(util::respace(p.description.as_ref().unwrap_or(&p.name)).as_ref());
+    let derive_regs = p_derivedfrom.is_some() && p_original.registers.is_none();
 
     let name_sc = Ident::new(&*p.name.to_sanitized_snake_case());
-    let (base, derived) = if let Some(base) = p.derived_from.as_ref() {
-        // TODO Verify that base exists
-        // TODO We don't handle inheritance style `derivedFrom`, we should raise
-        // an error in that case
-        (Ident::new(&*base.to_sanitized_snake_case()), true)
+    let base = if derive_regs {
+        Ident::new(&*p_derivedfrom.unwrap().name.to_sanitized_snake_case())
     } else {
-        (name_sc.clone(), false)
+        name_sc.clone()
     };
 
     // Insert the peripheral structure
@@ -56,17 +67,92 @@ pub fn render(
         }
     });
 
-    // Derived peripherals do not require re-implementation, and will instead
-    // use a single definition of the non-derived version
-    if derived {
+    // Derived peripherals may not require re-implementation, and will instead
+    // use a single definition of the non-derived version.
+    if derive_regs {
         return Ok(out);
     }
 
     // erc: *E*ither *R*egister or *C*luster
     let ercs = p.registers.as_ref().map(|x| x.as_ref()).unwrap_or(&[][..]);
-
     let registers: &[&Register] = &util::only_registers(&ercs)[..];
+
+    // make a pass to expand derived registers.  Ideally, for the most minimal
+    // code size, we'd do some analysis to figure out if we can 100% reuse the
+    // code that we're deriving from.  For the sake of proving the concept, we're
+    // just going to emit a second copy of the accessor code.  It'll probably
+    // get inlined by the compiler anyway, right? :-)
+
+    // Build a map so that we can look up registers within this peripheral
+    let mut reg_map = HashMap::new();
+    for r in registers {
+        reg_map.insert(&r.name, r.clone());
+    }
+
+    // Compute the effective, derived version of a register given the definition
+    // with the derived_from property on it (`info`) and its `ancestor`
+    fn derive_reg_info(info: &RegisterInfo, ancestor: &RegisterInfo) -> RegisterInfo {
+        let mut derived = info.clone();
+
+        if derived.size.is_none() {
+            derived.size = ancestor.size.clone();
+        }
+        if derived.access.is_none() {
+            derived.access = ancestor.access.clone();
+        }
+        if derived.reset_value.is_none() {
+            derived.reset_value = ancestor.reset_value.clone();
+        }
+        if derived.reset_mask.is_none() {
+            derived.reset_mask = ancestor.reset_mask.clone();
+        }
+        if derived.fields.is_none() {
+            derived.fields = ancestor.fields.clone();
+        }
+        if derived.write_constraint.is_none() {
+            derived.write_constraint = ancestor.write_constraint.clone();
+        }
+
+        derived
+    }
+
+    // Build up an alternate erc list by expanding any derived registers
+    let mut alt_erc :Vec<RegisterCluster> = registers.iter().filter_map(|r| {
+        match r.derived_from {
+            Some(ref derived) => {
+                let ancestor = match reg_map.get(derived) {
+                    Some(r) => r,
+                    None => {
+                        eprintln!("register {} derivedFrom missing register {}", r.name, derived);
+                        return None
+                    }
+                };
+
+                let d = match **ancestor {
+                    Register::Array(ref info, ref array_info) => {
+                        Some(Register::Array(derive_reg_info(*r, info), array_info.clone()).into())
+                    }
+                    Register::Single(ref info) => {
+                        Some(Register::Single(derive_reg_info(*r, info)).into())
+                    }
+                };
+
+                d
+            }
+            None => Some((*r).clone().into()),
+        }
+    }).collect();
+
+    // Now add the clusters to our alternate erc list
     let clusters = util::only_clusters(ercs);
+    for cluster in &clusters {
+        alt_erc.push((*cluster).clone().into());
+    }
+
+    // And revise registers, clusters and ercs to refer to our expanded versions
+    let registers: &[&Register] = &util::only_registers(alt_erc.as_slice())[..];
+    let clusters = util::only_clusters(ercs);
+    let ercs = &alt_erc;
 
     // No `struct RegisterBlock` can be generated
     if registers.is_empty() && clusters.is_empty() {
@@ -77,7 +163,7 @@ pub fn render(
 
     // Push any register or cluster blocks into the output
     let mut mod_items = vec![];
-    mod_items.push(register_or_cluster_block(ercs, defaults, None, nightly)?);
+    mod_items.push(register_or_cluster_block(ercs.as_slice(), defaults, None, nightly)?);
 
     // Push all cluster related information into the peripheral module
     for c in &clusters {
@@ -346,7 +432,7 @@ impl FieldRegions {
 }
 
 fn register_or_cluster_block(
-    ercs: &[Either<Register, Cluster>],
+    ercs: &[RegisterCluster],
     defs: &Defaults,
     name: Option<&str>,
     nightly: bool,
@@ -359,7 +445,7 @@ fn register_or_cluster_block(
 }
 
 fn register_or_cluster_block_stable(
-    ercs: &[Either<Register, Cluster>],
+    ercs: &[RegisterCluster],
     defs: &Defaults,
     name: Option<&str>,
 ) -> Result<Tokens> {
@@ -424,7 +510,7 @@ fn register_or_cluster_block_stable(
 }
 
 fn register_or_cluster_block_nightly(
-    ercs: &[Either<Register, Cluster>],
+    ercs: &[RegisterCluster],
     defs: &Defaults,
     name: Option<&str>,
 ) -> Result<Tokens> {
@@ -544,7 +630,7 @@ fn register_or_cluster_block_nightly(
 /// Expand a list of parsed `Register`s or `Cluster`s, and render them to
 /// `RegisterBlockField`s containing `Field`s.
 fn expand(
-    ercs: &[Either<Register, Cluster>],
+    ercs: &[RegisterCluster],
     defs: &Defaults,
     name: Option<&str>,
 ) -> Result<Vec<RegisterBlockField>> {
@@ -552,8 +638,8 @@ fn expand(
 
     for erc in ercs {
         ercs_expanded.extend(match erc {
-            Either::Left(ref register) => expand_register(register, defs, name)?,
-            Either::Right(ref cluster) => expand_cluster(cluster, defs)?,
+            RegisterCluster::Register(ref register) => expand_register(register, defs, name)?,
+            RegisterCluster::Cluster(ref cluster) => expand_cluster(cluster, defs)?,
         });
     }
 
@@ -569,7 +655,7 @@ fn cluster_size_in_bits(info: &ClusterInfo, defs: &Defaults) -> Result<u32> {
 
     for c in &info.children {
         let end = match *c {
-            Either::Left(ref reg) => {
+            RegisterCluster::Register(ref reg) => {
                 let reg_size: u32 = expand_register(reg, defs, None)?
                     .iter()
                     .map(|rbf| rbf.size)
@@ -577,7 +663,7 @@ fn cluster_size_in_bits(info: &ClusterInfo, defs: &Defaults) -> Result<u32> {
 
                 (reg.address_offset * BITS_PER_BYTE) + reg_size
             }
-            Either::Right(ref clust) => {
+            RegisterCluster::Cluster(ref clust) => {
                 (clust.address_offset * BITS_PER_BYTE) + cluster_size_in_bits(clust, defs)?
             }
         };
